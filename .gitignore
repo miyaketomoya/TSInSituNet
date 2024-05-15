@@ -2,3 +2,6 @@ logs/*
 log.txt
 __pycache__/
 *.pyc
+trainTransformer.yaml
+trainTransformerDummy.yaml
+trainVQGAN.yaml
