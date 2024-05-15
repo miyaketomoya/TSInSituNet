@@ -80,7 +80,13 @@ def get_storedir(opt,now):
         else:
             name = ""
         nowname = now+name+opt.postfix
-        logdir = os.path.join("logs", nowname)
+        
+        if "Transfromer" in opt.base:
+            logdir = os.path.join("logs/trans",nowname)
+        elif "GAN" in opt.base:
+            logdir = os.path.join("logs/gan",nowname)
+        else:
+            logdir = os.path.join("logs", nowname)
     
     logdir = os.path.join(os.getcwd(),logdir)
     ckptdir = os.path.join(logdir, "checkpoints")
@@ -171,7 +177,7 @@ def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
             }
         },
         "learning_rate_logger": {
-            "target": "main.LearningRateMonitor",
+            "target": "pytorch_lightning.callbacks.LearningRateMonitor",
             "params": {
                 "logging_interval": "step",
                 #"log_momentum": True
@@ -429,7 +435,7 @@ class ImageLogger(Callback):
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
 
-            grid = (grid+1.0)/2.0 # -1,1 -> 0,1; c,h,w
+            # grid = (grid+1.0)/2.0 # -1,1 -> 0,1; c,h,w
             grid = grid.transpose(0,1).transpose(1,2).squeeze(-1)
             grid = grid.numpy()
             grid = (grid*255).astype(np.uint8)

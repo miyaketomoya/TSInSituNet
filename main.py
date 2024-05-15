@@ -11,6 +11,7 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from util import *
 
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "expandable_segments:True"
 
 
 if __name__ == "__main__":

@@ -16,33 +16,22 @@ class Net2NetTransformer(pl.LightningModule):
     def __init__(self,
                  transformer_config,
                  first_stage_config,
-                 cond_stage_config,
                  permuter_config=None,
                  ckpt_path=None,
                  ignore_keys=[],
-                 first_stage_key="image",
-                 cond_stage_key="depth",
-                 downsample_cond_size=-1,
-                 pkeep=1.0,
-                #  sos_token=0,
-                #  unconditional=False,
                  ):
         super().__init__()
-        # self.be_unconditional = unconditional
-        # self.sos_token = sos_token
-        self.first_stage_key = first_stage_key
-        self.cond_stage_key = cond_stage_key
         self.init_first_stage_from_ckpt(first_stage_config)
-        # self.init_cond_stage_from_ckpt(cond_stage_config)
         if permuter_config is None:
-            permuter_config = {"target": "taming.modules.transformer.permuter.Identity"}
+            permuter_config = {"target": "LatentPredictor.transformer.permuter.Identity"}
         self.permuter = instantiate_from_config(config=permuter_config)
         self.transformer = instantiate_from_config(config=transformer_config)
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
-        self.downsample_cond_size = downsample_cond_size
-        self.pkeep = pkeep
+        
+        print(self.permuter)
+        print(self.transformer)
 
     #ckpt_patがロードするモデルのpath　関係ないデータを削除？
     def init_from_ckpt(self, path, ignore_keys=list()):
@@ -61,35 +50,88 @@ class Net2NetTransformer(pl.LightningModule):
         model.train = disabled_train
         self.first_stage_model = model
 
-    # def init_cond_stage_from_ckpt(self, config):
-    #     if config == "__is_first_stage__":
-    #         print("Using first stage also as cond stage.")
-    #         self.cond_stage_model = self.first_stage_model
-
-    def forward(self, x, c, target):
-        # one step to produce the logits
+    def forward(self,x,c,temperature=1.0,top_k=1,base_num=1):
+        """
+        input
+        x:入力画像(batch,3,512,512)
+        c:入力画像の条件()
+        
+        output
+        output:予想後のコードブロック
+        """
+        
+        #taegetとxのコードブロックを取得
         _, z_indices = self.encode_to_z(x)
-        # _, c_indices = self.encode_to_c(c)
+        
+        if base_num == 1:
+            base_num = z_indices.shape[1]
+        input = z_indices
+    
+        for k in range(base_num):
+            logits = self.transformer(input,c_embeddings=c)            
+            #最後のidのところだけ撮って、確率の高いIDだけ残す
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                logits = self.top_k_logits(logits, top_k)
+            # apply softmax to convert to probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution or take the most likely
+            _, ix = torch.topk(probs, k=1, dim=-1)
+            # append to the sequence and continue
 
-        if self.training and self.pkeep < 1.0:
-            mask = torch.bernoulli(self.pkeep*torch.ones(z_indices.shape,
-                                                         device=z_indices.device))
-            mask = mask.round().to(dtype=torch.int64)
-            r_indices = torch.randint_like(z_indices, self.transformer.config.vocab_size)
-            a_indices = mask*z_indices+(1-mask)*r_indices
-        else:
-            a_indices = z_indices
+            input = torch.cat((input, ix), dim=1)
 
+        return input[:,base_num:]
+    
+    def train_forward(self, x, c, t,temperature=1.0,top_k=1):
+        """
+        input
+        x:入力画像(batch,3,512,512)
+        c:入力画像の条件()
+        t:予測してほしいタイムステップ後の画像
+        
+        output
+        output:予想後のコードブロック
+        target:正解
+        """
+        
+        #taegetとxのコードブロックを取得
+        _, t_indices = self.encode_to_z(t)
+        _, z_indices = self.encode_to_z(x)
+        ix_num = t_indices.shape[1]
+        base_num = z_indices.shape[1]
+        batch_size = z_indices.shape[0]  # バッチサイズをz_indicesから取得
+        device = z_indices.device  # デバイス情報をz_indicesから取得
+        
+        input = torch.cat((z_indices,t_indices), dim=1)
+    
+        # 空のTensorを作成。最初は列が0なので、次元を追加しないといけない
+        output = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+        
+        loss = 0
+        for k in range(ix_num):
+            logits = self.transformer(input[:,:base_num+k],c_embeddings=c)
+            loss += F.cross_entropy(logits[:, -1, :], input[:,base_num+k])
 
-        # target includes all sequence elements (no need to handle first one
-        # differently because we are conditioning)
-        target = z_indices
-        # make the prediction
-        logits, _ = self.transformer(a_indices[:, :-1],c)
-        # cut off conditioning outputs - output i corresponds to p(z_i | z_{<i}, c)
-        logits = logits[:, a_indices.shape[1]-1:]
-
-        return logits, target
+            # print(k,logits[:, -1, :].shape)
+            # print(k,input[:,base_num+k])
+            # print(k)
+            
+            #最後のidのところだけ撮って、確率の高いIDだけ残す
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                logits = self.top_k_logits(logits, top_k)
+            # apply softmax to convert to probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution or take the most likely
+            _, ix = torch.topk(probs, k=1, dim=-1)
+            # append to the sequence and continue
+            output = torch.cat((output, ix), dim=1)
+        
+        # print(output) 
+        # print(target)
+        return output,loss
+    
 
     def top_k_logits(self, logits, k):
         v, ix = torch.topk(logits, k)
@@ -98,54 +140,31 @@ class Net2NetTransformer(pl.LightningModule):
         return out
 
     @torch.no_grad()
-    def sample(self, x, c, steps, temperature=1.0, sample=False, top_k=None,
-               callback=lambda k: None):
-        x = torch.cat((c,x),dim=1)
-        block_size = self.transformer.get_block_size()
-        assert not self.transformer.training
-        for k in range(steps):
-            callback(k)
-            assert x.size(1) <= block_size # make sure model can see conditioning
-            x_cond = x if x.size(1) <= block_size else x[:, -block_size:]  # crop context if needed
-            logits, _ = self.transformer(x_cond)
-            # pluck the logits at the final step and scale by temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop probabilities to only the top k options
-            
-            #最後のidのところだけ撮って、確率の高いIDだけ残す
-            if top_k is not None:
-                logits = self.top_k_logits(logits, top_k)
-            # apply softmax to convert to probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution or take the most likely
-            if sample:
-                ix = torch.multinomial(probs, num_samples=1)
-            else:
-                _, ix = torch.topk(probs, k=1, dim=-1)
-            # append to the sequence and continue
-            x = torch.cat((x, ix), dim=1)
-        # cut off conditioning
-        x = x[:, c.shape[1]:]
-        return x
-
-    @torch.no_grad()
     def encode_to_z(self, x):
+        """
+        input
+        x:image_data(b,3,512,512)
+        
+        output
+        quant_z: code_img
+        indices: code_seq (permute)
+        """
+        
         quant_z, _, info = self.first_stage_model.encode(x)
         indices = info[2].view(quant_z.shape[0], -1)
         indices = self.permuter(indices)
         return quant_z, indices
 
     @torch.no_grad()
-    def encode_to_c(self, c):
-        if self.downsample_cond_size > -1:
-            c = F.interpolate(c, size=(self.downsample_cond_size, self.downsample_cond_size))
-        quant_c, _, [_,_,indices] = self.cond_stage_model.encode(c)
-        if len(indices.shape) > 2:
-            indices = indices.view(c.shape[0], -1)
-        return quant_c, indices
-
-    @torch.no_grad()
     def decode_to_img(self, index, zshape):
+        """
+        input
+        index:flatten codeblock
+        
+        output
+        x:image
+        """
+
         index = self.permuter(index, reverse=True)
         bhwc = (zshape[0],zshape[2],zshape[3],zshape[1])
         quant_z = self.first_stage_model.quantize.get_codebook_entry(
@@ -158,104 +177,74 @@ class Net2NetTransformer(pl.LightningModule):
         log = dict()
 
         N = 4
-        if lr_interface:
-            x, c = self.get_xc(batch, N, diffuse=False, upsample_factor=8)
-        else:
-            x, c = self.get_xc(batch, N)
+        x, c, t= self.get_xct(batch, N)
         x = x.to(device=self.device)
-        c = c.to(device=self.device)
+        if isinstance(c, dict):
+            c = {key: value.to(device=self.device) for key, value in c.items()}
+        t = t.to(device=self.device)
 
+        
+        # quant_z, z_indices = self.encode_to_z(x)
+        
+        #index_sample->t_sample_det:生成したコードブロックの復元,
+        #target->t_rec:正解のコードブロックの復元
+        
         quant_z, z_indices = self.encode_to_z(x)
-        quant_c, c_indices = self.encode_to_c(c)
+        quant_t, t_indices = self.encode_to_z(t)
+        
+        index_sample,loss = self.train_forward(x,c,t)
+        t_sample_det = self.decode_to_img(index_sample, quant_t.shape)
+        
+        input_code_block = self.code_to_img(z_indices,quant_z.shape)
+        target_code_block_ans = self.code_to_img(t_indices, quant_t.shape)
+        target_code_block_predict = self.code_to_img(index_sample, quant_t.shape)
 
-        # create a "half"" sample
-        z_start_indices = z_indices[:,:z_indices.shape[1]//2]
-        index_sample = self.sample(z_start_indices, c_indices,
-                                   steps=z_indices.shape[1]-z_start_indices.shape[1],
-                                   temperature=temperature if temperature is not None else 1.0,
-                                   sample=True,
-                                   top_k=top_k if top_k is not None else 100,
-                                   callback=callback if callback is not None else lambda k: None)
-        x_sample = self.decode_to_img(index_sample, quant_z.shape)
-
-        # sample
-        z_start_indices = z_indices[:, :0]
-        index_sample = self.sample(z_start_indices, c_indices,
-                                   steps=z_indices.shape[1],
-                                   temperature=temperature if temperature is not None else 1.0,
-                                   sample=True,
-                                   top_k=top_k if top_k is not None else 100,
-                                   callback=callback if callback is not None else lambda k: None)
-        x_sample_nopix = self.decode_to_img(index_sample, quant_z.shape)
-
-        # det sample
-        z_start_indices = z_indices[:, :0]
-        index_sample = self.sample(z_start_indices, c_indices,
-                                   steps=z_indices.shape[1],
-                                   sample=False,
-                                   callback=callback if callback is not None else lambda k: None)
-        x_sample_det = self.decode_to_img(index_sample, quant_z.shape)
-
-        # reconstruction
-        x_rec = self.decode_to_img(z_indices, quant_z.shape)
-
-        log["inputs"] = x
-        log["reconstructions"] = x_rec
-
-        if self.cond_stage_key in ["objects_bbox", "objects_center_points"]:
-            figure_size = (x_rec.shape[2], x_rec.shape[3])
-            dataset = kwargs["pl_module"].trainer.datamodule.datasets["validation"]
-            label_for_category_no = dataset.get_textual_label_for_category_no
-            plotter = dataset.conditional_builders[self.cond_stage_key].plot
-            log["conditioning"] = torch.zeros_like(log["reconstructions"])
-            for i in range(quant_c.shape[0]):
-                log["conditioning"][i] = plotter(quant_c[i], label_for_category_no, figure_size)
-            log["conditioning_rec"] = log["conditioning"]
-        elif self.cond_stage_key != "image":
-            cond_rec = self.cond_stage_model.decode(quant_c)
-            if self.cond_stage_key == "segmentation":
-                # get image from segmentation mask
-                num_classes = cond_rec.shape[1]
-
-                c = torch.argmax(c, dim=1, keepdim=True)
-                c = F.one_hot(c, num_classes=num_classes)
-                c = c.squeeze(1).permute(0, 3, 1, 2).float()
-                c = self.cond_stage_model.to_rgb(c)
-
-                cond_rec = torch.argmax(cond_rec, dim=1, keepdim=True)
-                cond_rec = F.one_hot(cond_rec, num_classes=num_classes)
-                cond_rec = cond_rec.squeeze(1).permute(0, 3, 1, 2).float()
-                cond_rec = self.cond_stage_model.to_rgb(cond_rec)
-            log["conditioning_rec"] = cond_rec
-            log["conditioning"] = c
-
-        log["samples_half"] = x_sample
-        log["samples_nopix"] = x_sample_nopix
-        log["samples_det"] = x_sample_det
+        log["input"] = x
+        log["input_code_block"] = input_code_block
+        # log["reconstruct_input_image"] = self.decode_to_img(z_indices,quant_z.shape)
+        
+        log["target"] = t
+        log["target_code_block_ans"] = target_code_block_ans
+        # log["reconstruct_target_image_ans"] = self.decode_to_img(t_indices, quant_t.shape)
+         
+        log["target_code_block_predict"] = target_code_block_predict
+        log["reconstruct_target_image_predict"] = self.decode_to_img(index_sample, quant_t.shape)
+        
+        log["code_block_diff"] = torch.abs(target_code_block_ans-target_code_block_predict)
+        
         return log
+    
+    def code_to_img(self,index,zshape):
+        index = self.permuter(index, reverse=True)
+        index = index/self.transformer.config.vocab_size
+        img_index = index.view(zshape[0],zshape[2],zshape[3])
+        return img_index
+        
 
     def get_input(self, key, batch):
         x = batch[key]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        if len(x.shape) == 4:
-            x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
-        if x.dtype == torch.double:
-            x = x.float()
+        # if len(x.shape) == 3:
+        #     x = x[..., None]
+        # if len(x.shape) == 4:
+        #     x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
+        # if x.dtype == torch.double:
+        #     x = x.float()
         return x
 
-    def get_xc(self, batch, N=None):
-        x = self.get_input(self.first_stage_key, batch)
-        c = self.get_input(self.cond_stage_key, batch)
+    def get_xct(self, batch, N=None):
+        x = self.get_input("image", batch)
+        c = self.get_input("params", batch)
+        t = self.get_input("target",batch)
         if N is not None:
             x = x[:N]
-            c = c[:N]
-        return x, c
+            for key in c.keys():
+                c[key] = c[key][:N]
+            t = t[:N]
+        return x, c, t
 
     def shared_step(self, batch, batch_idx):
-        x, c = self.get_xc(batch)
-        logits, target = self(x, c)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+        x, c, t = self.get_xct(batch)
+        logits,loss = self.train_forward(x, c, t)
         return loss
 
     def training_step(self, batch, batch_idx):

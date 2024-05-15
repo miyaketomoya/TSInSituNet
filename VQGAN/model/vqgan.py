@@ -6,12 +6,16 @@ from VQGAN.modules.vqvae.vae import Decoder, Encoder
 from VQGAN.modules.vqvae.quantize import VectorQuantizer
 from util import instantiate_from_config
 
+import time
+
 class VQModel(pl.LightningModule):
     def __init__(self,
                  ddconfig,
                  lossconfig,
                  n_embed,
                  embed_dim,
+                 ckpt_path=None,
+                 ignore_keys=[],
                  image_key="image",
                  remap=None,
                  sane_index_shape=False,  # tell vector quantizer to return indices as bhw
@@ -23,9 +27,26 @@ class VQModel(pl.LightningModule):
         self.loss = instantiate_from_config(lossconfig)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
+        
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.automatic_optimization = False
+        
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+            
         print(self.encoder)
+
+    def init_from_ckpt(self, path, ignore_keys=list()):
+        sd = torch.load(path, map_location="cpu")["state_dict"]
+        keys = list(sd.keys())
+        # print(keys)
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+        self.load_state_dict(sd, strict=True)
+        print(f"Restored from {path}")
 
     def encode(self, x):
         h = self.encoder(x)
@@ -45,11 +66,12 @@ class VQModel(pl.LightningModule):
 
     def forward(self, input):
         quant, diff, _ = self.encode(input)
+        # print(quant.shape)
         dec = self.decode(quant)
         return dec, diff
 
     def get_input(self, batch, k):
-        x = batch[k]
+        x = batch["image"]
         if len(x.shape) == 3:
             x = x[..., None]
         # x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
@@ -141,3 +163,19 @@ class VQModel(pl.LightningModule):
         x = F.conv2d(x, weight=self.colorize)
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
+
+class DummyModel(pl.LightningModule):
+    def __init__(self,batch):
+        super().__init__()
+        self.img = torch.zeros(batch, 3, 512, 512)
+        self.coodblock = torch.zeros(batch, 64,64)
+        
+    def encode(self,x):
+        print("sleeping")
+        time.sleep(30)
+        
+        return self.img,0,0
+        
+    def decode(self,x):
+        return self.coodblock
+    

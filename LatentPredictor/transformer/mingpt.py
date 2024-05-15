@@ -125,7 +125,7 @@ class Block(nn.Module):
 class GPT(nn.Module):
     """  the full GPT language model, with a context size of block_size """
     def __init__(self, vocab_size, block_size, n_layer=12, n_head=8, n_embd=256,
-                 embd_pdrop=0., resid_pdrop=0., attn_pdrop=0., n_unmasked=0,cnd_dim = 4):
+                 embd_pdrop=0., resid_pdrop=0., attn_pdrop=0., n_unmasked=0):
         super().__init__()
         config = GPTConfig(vocab_size=vocab_size, block_size=block_size,
                            embd_pdrop=embd_pdrop, resid_pdrop=resid_pdrop, attn_pdrop=attn_pdrop,
@@ -136,7 +136,8 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         
         #cnd_emb作成
-        self.cnd_emb = nn.Linear(cnd_dim,config.n_embd)
+        self.view_emb = nn.Linear(3,config.n_embd)
+        self.sim_emb = nn.Linear(2,config.n_embd)
         
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
@@ -161,14 +162,26 @@ class GPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, idx, c_embeddings=None, targets=None):
+    def forward(self, idx, c_embeddings=None):
+        """
+        input
+        idx:参照する過去のデータ
+        c_embeddings:パラメータデータ(少数のため、整数データではなく、埋め込み後のベクトルとして結合)
+        
+        output
+        logits:すべてのトークンに対して次の予測(最後の次元が次の予測)
+        """
         # forward the GPT model
         token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
 
         if c_embeddings is not None: # prepend explicit embeddings
-            c_embeddings = self.cnd_emb(c_embeddings)
-            c_embeddings = c_embeddings.unsqueeze(1)
-            token_embeddings = torch.cat((c_embeddings, token_embeddings), dim=1)
+            
+            simparam = c_embeddings["simparam"]
+            viewparam = c_embeddings["viewparam"]
+            sim_embeddings = self.sim_emb(simparam).unsqueeze(1)
+            view_embeddings = self.view_emb(viewparam).unsqueeze(1)
+            cond_embeddings = torch.cat((sim_embeddings,view_embeddings),dim=1)
+            token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
 
         t = token_embeddings.shape[1]
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
@@ -177,56 +190,11 @@ class GPT(nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.head(x)
+        
+        # print(logits.shape)
 
         # if we are given some desired targets also calculate the loss
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        return logits, loss
-
-    def forward_with_past(self, idx, embeddings=None, targets=None, past=None, past_length=None):
-        # inference only
-        assert not self.training
-        token_embeddings = self.tok_emb(idx)    # each index maps to a (learnable) vector
-        if embeddings is not None:              # prepend explicit embeddings
-            token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
-
-        if past is not None:
-            assert past_length is not None
-            past = torch.cat(past, dim=-2)   # n_layer, 2, b, nh, len_past, dim_head
-            past_shape = list(past.shape)
-            expected_shape = [self.config.n_layer, 2, idx.shape[0], self.config.n_head, past_length, self.config.n_embd//self.config.n_head]
-            assert past_shape == expected_shape, f"{past_shape} =/= {expected_shape}"
-            position_embeddings = self.pos_emb[:, past_length, :]  # each position maps to a (learnable) vector
-        else:
-            position_embeddings = self.pos_emb[:, :token_embeddings.shape[1], :]
-
-        x = self.drop(token_embeddings + position_embeddings)
-        presents = []  # accumulate over layers
-        for i, block in enumerate(self.blocks):
-            x, present = block(x, layer_past=past[i, ...] if past is not None else None, return_present=True)
-            presents.append(present)
-
-        x = self.ln_f(x)
-        logits = self.head(x)
-        # if we are given some desired targets also calculate the loss
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        return logits, loss, torch.stack(presents)  # _, _, n_layer, 2, b, nh, 1, dim_head
-
-
-class DummyGPT(nn.Module):
-    # for debugging
-    def __init__(self, add_value=1):
-        super().__init__()
-        self.add_value = add_value
-
-    def forward(self, idx):
-        return idx + self.add_value, None
-
+        return logits
 
 #### sampling utils
 
@@ -265,98 +233,3 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
         x = torch.cat((x, ix), dim=1)
 
     return x
-
-
-@torch.no_grad()
-def sample_with_past(x, model, steps, temperature=1., sample_logits=True,
-                     top_k=None, top_p=None, callback=None):
-    # x is conditioning
-    sample = x
-    cond_len = x.shape[1]
-    past = None
-    for n in range(steps):
-        if callback is not None:
-            callback(n)
-        logits, _, present = model.forward_with_past(x, past=past, past_length=(n+cond_len-1))
-        if past is None:
-            past = [present]
-        else:
-            past.append(present)
-        logits = logits[:, -1, :] / temperature
-        if top_k is not None:
-            logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-
-        probs = F.softmax(logits, dim=-1)
-        if not sample_logits:
-            _, x = torch.topk(probs, k=1, dim=-1)
-        else:
-            x = torch.multinomial(probs, num_samples=1)
-        # append to the sequence and continue
-        sample = torch.cat((sample, x), dim=1)
-    del past
-    sample = sample[:, cond_len:]  # cut conditioning off
-    return sample
-
-
-#### clustering utils
-
-class KMeans(nn.Module):
-    def __init__(self, ncluster=512, nc=3, niter=10):
-        super().__init__()
-        self.ncluster = ncluster
-        self.nc = nc
-        self.niter = niter
-        self.shape = (3,32,32)
-        self.register_buffer("C", torch.zeros(self.ncluster,nc))
-        self.register_buffer('initialized', torch.tensor(0, dtype=torch.uint8))
-
-    def is_initialized(self):
-        return self.initialized.item() == 1
-
-    @torch.no_grad()
-    def initialize(self, x):
-        N, D = x.shape
-        assert D == self.nc, D
-        c = x[torch.randperm(N)[:self.ncluster]] # init clusters at random
-        for i in range(self.niter):
-            # assign all pixels to the closest codebook element
-            a = ((x[:, None, :] - c[None, :, :])**2).sum(-1).argmin(1)
-            # move each codebook element to be the mean of the pixels that assigned to it
-            c = torch.stack([x[a==k].mean(0) for k in range(self.ncluster)])
-            # re-assign any poorly positioned codebook elements
-            nanix = torch.any(torch.isnan(c), dim=1)
-            ndead = nanix.sum().item()
-            print('done step %d/%d, re-initialized %d dead clusters' % (i+1, self.niter, ndead))
-            c[nanix] = x[torch.randperm(N)[:ndead]] # re-init dead clusters
-
-        self.C.copy_(c)
-        self.initialized.fill_(1)
-
-
-    def forward(self, x, reverse=False, shape=None):
-        if not reverse:
-            # flatten
-            bs,c,h,w = x.shape
-            assert c == self.nc
-            x = x.reshape(bs,c,h*w,1)
-            C = self.C.permute(1,0)
-            C = C.reshape(1,c,1,self.ncluster)
-            a = ((x-C)**2).sum(1).argmin(-1) # bs, h*w indices
-            return a
-        else:
-            # flatten
-            bs, HW = x.shape
-            """
-            c = self.C.reshape( 1, self.nc,  1, self.ncluster)
-            c = c[bs*[0],:,:,:]
-            c = c[:,:,HW*[0],:]
-            x =      x.reshape(bs,       1, HW,             1)
-            x = x[:,3*[0],:,:]
-            x = torch.gather(c, dim=3, index=x)
-            """
-            x = self.C[x]
-            x = x.permute(0,2,1)
-            shape = shape if shape is not None else self.shape
-            x = x.reshape(bs, *shape)
-
-            return x
