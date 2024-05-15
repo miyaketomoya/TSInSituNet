@@ -16,7 +16,7 @@ model:
     first_stage_config:
       target: VQGAN.model.vqgan.VQModel
       params:
-        ckpt_path: /home/tomoyam/Study/logs/2024-05-07T18-40-13_VQGANSmokeRing/checkpoints/epoch=000099.ckpt
+        ckpt_path: /home/tomoyam/TSInSituNet/logs/2024-05-07T18-40-13_VQGANSmokeRing/checkpoints/epoch=000099.ckpt #path to modeldata
         ignore_keys: ["loss"]
         embed_dim: 256
         n_embed: 16384
@@ -42,7 +42,7 @@ data:
     train:
       target: data.smokeRing2.SmokeRingTrain
       params:
-        root: /data/data2/tomoya/dataSet
+        root: /data/data2/tomoya/dataSet #path to dataset
         toTensor: True
         normalizeImage: True
     
