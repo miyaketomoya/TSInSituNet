@@ -8,8 +8,8 @@ GPT model:
 - the final decoder is a linear projection into a vanilla Softmax classifier
 """
 
-import math
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 class GPTConfig:
-    """ base GPT config, params common to all GPT versions """
+    """base GPT config, params common to all GPT versions"""
+
     embd_pdrop = 0.1
     resid_pdrop = 0.1
     attn_pdrop = 0.1
@@ -28,12 +29,13 @@ class GPTConfig:
     def __init__(self, vocab_size, block_size, **kwargs):
         self.vocab_size = vocab_size
         self.block_size = block_size
-        for k,v in kwargs.items():
+        for k, v in kwargs.items():
             setattr(self, k, v)
 
 
 class GPT1Config(GPTConfig):
-    """ GPT-1 like network roughly 125M params """
+    """GPT-1 like network roughly 125M params"""
+
     n_layer = 12
     n_head = 12
     n_embd = 768
@@ -59,20 +61,27 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        mask = torch.tril(torch.ones(config.block_size,
-                                     config.block_size))
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
         if hasattr(config, "n_unmasked"):
-            mask[:config.n_unmasked, :config.n_unmasked] = 1
-        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))
+            mask[: config.n_unmasked, : config.n_unmasked] = 1
+        self.register_buffer(
+            "mask", mask.view(1, 1, config.block_size, config.block_size)
+        )
         self.n_head = config.n_head
 
     def forward(self, x, layer_past=None):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = (
+            self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
+        q = (
+            self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
+        v = (
+            self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
 
         present = torch.stack((k, v))
         if layer_past is not None:
@@ -83,20 +92,23 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         if layer_past is None:
-            att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
 
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_drop(self.proj(y))
-        return y, present   # TODO: check that this does not break anything
+        return y, present  # TODO: check that this does not break anything
 
 
 class Block(nn.Module):
-    """ an unassuming Transformer block """
+    """an unassuming Transformer block"""
+
     def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
@@ -111,7 +123,8 @@ class Block(nn.Module):
 
     def forward(self, x, layer_past=None, return_present=False):
         # TODO: check that training still works
-        if return_present: assert not self.training
+        if return_present:
+            assert not self.training
         # layer past: tuple of length two with B, nh, T, hs
         attn, present = self.attn(self.ln1(x), layer_past=layer_past)
 
@@ -123,22 +136,40 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    """  the full GPT language model, with a context size of block_size """
-    def __init__(self, vocab_size, block_size, n_layer=12, n_head=8, n_embd=256,
-                 embd_pdrop=0., resid_pdrop=0., attn_pdrop=0., n_unmasked=0):
+    """the full GPT language model, with a context size of block_size"""
+
+    def __init__(
+        self,
+        vocab_size,
+        block_size,
+        n_layer=12,
+        n_head=8,
+        n_embd=256,
+        embd_pdrop=0.0,
+        resid_pdrop=0.0,
+        attn_pdrop=0.0,
+        n_unmasked=0,
+    ):
         super().__init__()
-        config = GPTConfig(vocab_size=vocab_size, block_size=block_size,
-                           embd_pdrop=embd_pdrop, resid_pdrop=resid_pdrop, attn_pdrop=attn_pdrop,
-                           n_layer=n_layer, n_head=n_head, n_embd=n_embd,
-                           n_unmasked=n_unmasked)
+        config = GPTConfig(
+            vocab_size=vocab_size,
+            block_size=block_size,
+            embd_pdrop=embd_pdrop,
+            resid_pdrop=resid_pdrop,
+            attn_pdrop=attn_pdrop,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            n_unmasked=n_unmasked,
+        )
         # input embedding stem
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
-        
-        #cnd_emb作成
-        self.view_emb = nn.Linear(3,config.n_embd)
-        self.sim_emb = nn.Linear(2,config.n_embd)
-        
+
+        # cnd_emb作成
+        self.view_emb = nn.Linear(3, config.n_embd)
+        self.sim_emb = nn.Linear(2, config.n_embd)
+
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
@@ -148,7 +179,9 @@ class GPT(nn.Module):
         self.block_size = config.block_size
         self.apply(self._init_weights)
         self.config = config
-        logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+        logger.info(
+            "number of parameters: %e", sum(p.numel() for p in self.parameters())
+        )
 
     def get_block_size(self):
         return self.block_size
@@ -167,42 +200,47 @@ class GPT(nn.Module):
         input
         idx:参照する過去のデータ
         c_embeddings:パラメータデータ(少数のため、整数データではなく、埋め込み後のベクトルとして結合)
-        
+
         output
         logits:すべてのトークンに対して次の予測(最後の次元が次の予測)
         """
         # forward the GPT model
-        token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
+        token_embeddings = self.tok_emb(idx)  # each index maps to a (learnable) vector
 
-        if c_embeddings is not None: # prepend explicit embeddings
-            
+        if c_embeddings is not None:  # prepend explicit embeddings
+
             simparam = c_embeddings["simparam"]
             viewparam = c_embeddings["viewparam"]
             sim_embeddings = self.sim_emb(simparam).unsqueeze(1)
             view_embeddings = self.view_emb(viewparam).unsqueeze(1)
-            cond_embeddings = torch.cat((sim_embeddings,view_embeddings),dim=1)
+            cond_embeddings = torch.cat((sim_embeddings, view_embeddings), dim=1)
             token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
 
         t = token_embeddings.shape[1]
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
-        position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
+        position_embeddings = self.pos_emb[
+            :, :t, :
+        ]  # each position maps to a (learnable) vector
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.head(x)
-        
+
         # print(logits.shape)
 
         # if we are given some desired targets also calculate the loss
         return logits
 
+
 #### sampling utils
+
 
 def top_k_logits(logits, k):
     v, ix = torch.topk(logits, k)
     out = logits.clone()
-    out[out < v[:, [-1]]] = -float('Inf')
+    out[out < v[:, [-1]]] = -float("Inf")
     return out
+
 
 @torch.no_grad()
 def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
@@ -215,7 +253,9 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
     block_size = model.get_block_size()
     model.eval()
     for k in range(steps):
-        x_cond = x if x.size(1) <= block_size else x[:, -block_size:]  # crop context if needed
+        x_cond = (
+            x if x.size(1) <= block_size else x[:, -block_size:]
+        )  # crop context if needed
         logits, _ = model(x_cond)
         # pluck the logits at the final step and scale by temperature
         logits = logits[:, -1, :] / temperature

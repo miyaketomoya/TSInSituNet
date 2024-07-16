@@ -1,17 +1,22 @@
-import argparse, os, sys, datetime, glob, importlib
-from omegaconf import OmegaConf
+import argparse
+import datetime
+import glob
+import importlib
+import os
+import sys
+
 import numpy as np
-from PIL import Image
+import pytorch_lightning as pl
 import torch
 import torchvision
-from torch.utils.data import random_split, DataLoader, Dataset
-import pytorch_lightning as pl
-from pytorch_lightning import seed_everything
-from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities import rank_zero_only
 import wandb
-
+from omegaconf import OmegaConf
+from PIL import Image
+from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.trainer import Trainer
+from pytorch_lightning.utilities import rank_zero_only
+from torch.utils.data import DataLoader, Dataset, random_split
 
 """
 cofig.yami
@@ -22,19 +27,21 @@ params:
     s2:~
     s3:~
 """
-#classをロードしてそのクラスを返す 
+# classをロードしてそのクラスを返す
 def get_obj_from_str(string, reload=False):
-    module, cls = string.rsplit(".",1)
+    module, cls = string.rsplit(".", 1)
     if reload:
         module_imp = importlib.import_module(module)
         importlib.reload(module_imp)
-    return getattr(importlib.import_module(module, package=None),cls)
+    return getattr(importlib.import_module(module, package=None), cls)
 
-#config(辞書型)からtarget(モデルの場所)を取り出し、params(設定)で初期化したモデルreturn
+
+# config(辞書型)からtarget(モデルの場所)を取り出し、params(設定)で初期化したモデルreturn
 def instantiate_from_config(config):
     if not "target" in config:
         raise KeyError("Expeced key 'target' to instantinage")
-    return get_obj_from_str(config["target"])(**config.get("params",dict()))
+    return get_obj_from_str(config["target"])(**config.get("params", dict()))
+
 
 # def nondefault_trainer_args(opt):
 #     parser = argparse.ArgumentParser()
@@ -43,9 +50,7 @@ def instantiate_from_config(config):
 #     return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
 
 
-
-
-def get_storedir(opt,now):
+def get_storedir(opt, now):
     if opt.name and opt.resume:
         raise ValueError(
             "-n/--name and -r/--resume cannot be specified both."
@@ -57,7 +62,7 @@ def get_storedir(opt,now):
             raise ValueError("Cannot find {}".format(opt.resume))
         if os.path.isfile(opt.resume):
             paths = opt.resume.split("/")
-            idx = len(paths)-paths[::-1].index("logs")+1
+            idx = len(paths) - paths[::-1].index("logs") + 1
             logdir = "/".join(paths[:idx])
             ckpt = opt.resume
         else:
@@ -67,45 +72,45 @@ def get_storedir(opt,now):
 
         opt.resume_from_checkpoint = ckpt
         base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
-        opt.base = base_configs+opt.base
+        opt.base = base_configs + opt.base
         _tmp = logdir.split("/")
-        nowname = _tmp[_tmp.index("logs")+1]
+        nowname = _tmp[_tmp.index("logs") + 1]
     else:
         if opt.name:
-            name = "_"+opt.name
+            name = "_" + opt.name
         elif opt.base:
             cfg_fname = os.path.split(opt.base[0])[-1]
             cfg_name = os.path.splitext(cfg_fname)[0]
-            name = "_"+cfg_name
+            name = "_" + cfg_name
         else:
             name = ""
-        nowname = now+name+opt.postfix
-        
+        nowname = now + name + opt.postfix
+
         if "Transfromer" in opt.base:
-            logdir = os.path.join("logs/trans",nowname)
+            logdir = os.path.join("logs/trans", nowname)
         elif "GAN" in opt.base:
-            logdir = os.path.join("logs/gan",nowname)
+            logdir = os.path.join("logs/gan", nowname)
         else:
             logdir = os.path.join("logs", nowname)
-    
-    logdir = os.path.join(os.getcwd(),logdir)
+
+    logdir = os.path.join(os.getcwd(), logdir)
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
-    
-    print("logdir:",logdir)
-    print("ckptdir:",ckptdir)
-    print("cfgdir:",cfgdir)
-    
-    return opt,nowname,logdir,ckptdir,cfgdir
+
+    print("logdir:", logdir)
+    print("ckptdir:", ckptdir)
+    print("cfgdir:", cfgdir)
+
+    return opt, nowname, logdir, ckptdir, cfgdir
 
 
-def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
+def get_train_config(opt, nowname, logdir, ckptdir, cfgdir, now, unknown):
     configs = [OmegaConf.load(cfg) for cfg in opt.base]
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(*configs, cli)
     lightning_config = config.pop("lightning", OmegaConf.create())
-    
-    #trainerの設定を取り出して、変更があるところは反映させる(opt→trainer_config)
+
+    # trainerの設定を取り出して、変更があるところは反映させる(opt→trainer_config)
     trainer_config = lightning_config.get("trainer", OmegaConf.create())
     # default to ddp
     # trainer_config["strategy"] = "ddp_find_unused_parameters_true"
@@ -117,14 +122,13 @@ def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
         gpuinfo = trainer_config["accelerator"]
         print(f"Running on GPUs {gpuinfo}")
         cpu = False
-    
-    #trainer_opt: trainer作成時に投げる設定
+
+    # trainer_opt: trainer作成時に投げる設定
     trainer_opt = trainer_config
-    #lightning_configに戻す
+    # lightning_configに戻す
     lightning_config.trainer = trainer_config
 
-    
-    #wandb testtubeのlogget設定定義
+    # wandb testtubeのlogget設定定義
     default_logger_cfgs = {
         "wandb": {
             "target": "pytorch_lightning.loggers.WandbLogger",
@@ -133,26 +137,25 @@ def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
                 "save_dir": logdir,
                 "offline": opt.debug,
                 "id": nowname,
-                "project": "VQGAN"
-            }
+                "project": "VQGAN",
+            },
         },
         "testtube": {
             "target": "pytorch_lightning.loggers.TestTubeLogger",
             "params": {
                 "name": "testtube",
                 "save_dir": logdir,
-            }
+            },
         },
     }
-    
+
     default_logger_cfg = default_logger_cfgs["wandb"]
     logger_cfg = lightning_config.get("logger", OmegaConf.create())
     logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
-    
-    
+
     #!!!!!!Image_loggeの保存スパンをエポックごとに動的に決めるにはdataloaderを作成してからジャないと面倒　→ 今後処理順並び替え 今は手動で設定
-    
-    #callback関数を定義
+
+    # callback関数を定義
     default_callbacks_cfg = {
         "setup_callback": {
             "target": "util.SetupCallback",
@@ -164,7 +167,7 @@ def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
                 "cfgdir": cfgdir,
                 "config": config,
                 "lightning_config": lightning_config,
-            }
+            },
         },
         "image_logger": {
             "target": "util.ImageLogger",
@@ -173,31 +176,29 @@ def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
                 "max_images": 4,
                 "clamp": True,
                 "increase_log_steps": False,
-                
-            }
+            },
         },
         "learning_rate_logger": {
             "target": "pytorch_lightning.callbacks.LearningRateMonitor",
             "params": {
                 "logging_interval": "step",
-                #"log_momentum": True
-            }
+                # "log_momentum": True
+            },
         },
-        "checkpoint_callback":{
+        "checkpoint_callback": {
             "target": "pytorch_lightning.callbacks.ModelCheckpoint",
             "params": {
                 "dirpath": ckptdir,
                 "filename": "{epoch:06}",
                 "verbose": True,
                 "save_last": True,
-                "save_top_k": 1
-            }
-        } 
+                "save_top_k": 1,
+            },
+        },
     }
- 
+
     callbacks_cfg = lightning_config.get("callbacks", OmegaConf.create())
     callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
-    
 
     # print(lightning_config)
     # print(config)
@@ -205,18 +206,16 @@ def get_train_config(opt,nowname,logdir,ckptdir,cfgdir,now,unknown):
     # print(logger_cfg)
     # print(trainer_opt)
     # print(opt)
-    
+
     return {
-        "lightning_config":lightning_config,
-        "config":config,
-        "callbacks_cfg":callbacks_cfg,
-        "logger_cfg":logger_cfg,
-        "trainer_opt":trainer_opt,
-        "cpu":cpu,
+        "lightning_config": lightning_config,
+        "config": config,
+        "callbacks_cfg": callbacks_cfg,
+        "logger_cfg": logger_cfg,
+        "trainer_opt": trainer_opt,
+        "cpu": cpu,
     }
 
-
-    
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -274,7 +273,9 @@ def get_parser(**parser_kwargs):
         nargs="?",
         help="disable test",
     )
-    parser.add_argument("-p", "--project", help="name of new or path to existing project")
+    parser.add_argument(
+        "-p", "--project", help="name of new or path to existing project"
+    )
     parser.add_argument(
         "-d",
         "--debug",
@@ -304,6 +305,7 @@ def get_parser(**parser_kwargs):
 
 class WrappedDataset(Dataset):
     """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
+
     def __init__(self, dataset):
         self.data = dataset
 
@@ -313,13 +315,21 @@ class WrappedDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+
 class DataModuleFromConfig(pl.LightningDataModule):
-    def __init__(self, batch_size, train=None, validation=None, test=None,
-                 wrap=False, num_workers=None):
+    def __init__(
+        self,
+        batch_size,
+        train=None,
+        validation=None,
+        test=None,
+        wrap=False,
+        num_workers=None,
+    ):
         super().__init__()
         self.batch_size = batch_size
         self.dataset_configs = dict()
-        self.num_workers = num_workers if num_workers is not None else batch_size*2
+        self.num_workers = num_workers if num_workers is not None else batch_size * 2
         if train is not None:
             self.dataset_configs["train"] = train
             self.train_dataloader = self._train_dataloader
@@ -338,23 +348,33 @@ class DataModuleFromConfig(pl.LightningDataModule):
     def setup(self, stage=None):
         self.datasets = dict(
             (k, instantiate_from_config(self.dataset_configs[k]))
-            for k in self.dataset_configs)
+            for k in self.dataset_configs
+        )
         if self.wrap:
             for k in self.datasets:
                 self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_dataloader(self):
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=True)
+        return DataLoader(
+            self.datasets["train"],
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+        )
 
     def _val_dataloader(self):
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers)
+        return DataLoader(
+            self.datasets["validation"],
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+        )
 
     def _test_dataloader(self):
-        return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers)
+        return DataLoader(
+            self.datasets["test"],
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+        )
 
 
 class SetupCallback(Callback):
@@ -368,19 +388,22 @@ class SetupCallback(Callback):
         self.config = config
         self.lightning_config = lightning_config
 
-    
     def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
 
             print("Project config")
             print(OmegaConf.to_yaml(self.config))
-            OmegaConf.save(self.config,
-                           os.path.join(self.cfgdir, "{}-project.yaml".format(self.now)))
+            OmegaConf.save(
+                self.config,
+                os.path.join(self.cfgdir, "{}-project.yaml".format(self.now)),
+            )
 
             print("Lightning config")
             print(OmegaConf.to_yaml(self.lightning_config))
-            OmegaConf.save(OmegaConf.create({"lightning": self.lightning_config}),
-                           os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)))
+            OmegaConf.save(
+                OmegaConf.create({"lightning": self.lightning_config}),
+                os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)),
+            )
 
         else:
             # ModelCheckpoint callback created log directory --- remove it
@@ -393,9 +416,12 @@ class SetupCallback(Callback):
                 except FileNotFoundError:
                     pass
 
-#testTubeLoggerがないため一度消す
+
+# testTubeLoggerがないため一度消す
 class ImageLogger(Callback):
-    def __init__(self, batch_frequency, max_images, clamp=True, increase_log_steps=False):
+    def __init__(
+        self, batch_frequency, max_images, clamp=True, increase_log_steps=False
+    ):
         super().__init__()
         self.batch_freq = batch_frequency
         self.max_images = max_images
@@ -403,7 +429,7 @@ class ImageLogger(Callback):
             pl.loggers.WandbLogger: self._wandb,
             # pl.loggers.TestTubeLogger: self._testtube,
         }
-        self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
+        self.log_steps = [2**n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
         self.clamp = clamp
@@ -429,30 +455,29 @@ class ImageLogger(Callback):
     #             global_step=pl_module.global_step)
 
     @rank_zero_only
-    def log_local(self, save_dir, split, images,
-                  global_step, current_epoch, batch_idx):
+    def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
         root = os.path.join(save_dir, "images", split)
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
 
             # grid = (grid+1.0)/2.0 # -1,1 -> 0,1; c,h,w
-            grid = grid.transpose(0,1).transpose(1,2).squeeze(-1)
+            grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
             grid = grid.numpy()
-            grid = (grid*255).astype(np.uint8)
+            grid = (grid * 255).astype(np.uint8)
             filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
-                k,
-                global_step,
-                current_epoch,
-                batch_idx)
+                k, global_step, current_epoch, batch_idx
+            )
             path = os.path.join(root, filename)
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             Image.fromarray(grid).save(path)
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
-        if (self.check_frequency(batch_idx) and  # batch_idx % self.batch_freq == 0
-                hasattr(pl_module, "log_images") and
-                callable(pl_module.log_images) and
-                self.max_images > 0):
+        if (
+            self.check_frequency(batch_idx)
+            and hasattr(pl_module, "log_images")  # batch_idx % self.batch_freq == 0
+            and callable(pl_module.log_images)
+            and self.max_images > 0
+        ):
             logger = type(pl_module.logger)
 
             is_train = pl_module.training
@@ -468,12 +493,20 @@ class ImageLogger(Callback):
                 if isinstance(images[k], torch.Tensor):
                     images[k] = images[k].detach().cpu()
                     if self.clamp:
-                        images[k] = torch.clamp(images[k], -1., 1.)
+                        images[k] = torch.clamp(images[k], -1.0, 1.0)
 
-            self.log_local(pl_module.logger.save_dir, split, images,
-                           pl_module.global_step, pl_module.current_epoch, batch_idx)
+            self.log_local(
+                pl_module.logger.save_dir,
+                split,
+                images,
+                pl_module.global_step,
+                pl_module.current_epoch,
+                batch_idx,
+            )
 
-            logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
+            logger_log_images = self.logger_log_images.get(
+                logger, lambda *args, **kwargs: None
+            )
             logger_log_images(pl_module, images, pl_module.global_step, split)
 
             if is_train:

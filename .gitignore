@@ -2,6 +2,13 @@ logs/*
 log.txt
 __pycache__/
 *.pyc
-trainTransformer.yaml
-trainTransformerDummy.yaml
-trainVQGAN.yaml
+
+viewer/output/*
+
+# configディレクトリ内の全てのファイルを無視
+config/*
+
+# 特定のファイルを追跡
+!config/ex_trainTransformer.yaml
+!config/ex_trainTransformerDummy.yaml
+!config/ex_trainVQGAN.yaml
